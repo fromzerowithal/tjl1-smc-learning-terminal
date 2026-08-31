@@ -30,6 +30,7 @@ button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .live { justify-self: end; color: var(--muted); text-align: right; }
 .live i { width: 7px; height: 7px; border-radius: 50%; background: var(--amber); }
 .live i.live { background: var(--green); box-shadow: 0 0 10px var(--green); }
+.live i.backup { background: var(--blue); box-shadow: 0 0 10px rgba(97,169,216,.5); }
 .live i.stale { background: var(--amber); box-shadow: 0 0 10px rgba(211,166,70,.45); }
 .live i.offline { background: var(--red); }
 .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 360px; min-height: calc(100vh - 68px); }
@@ -99,6 +100,8 @@ button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .signal-card li.current { color: var(--amber); }
 .signal-card li.current::before { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
 .strategy-card { margin-bottom: 13px; }
+.proxy-warning { margin: 0 0 12px; padding: 10px; border: 1px solid rgba(97,169,216,.42); background: rgba(97,169,216,.055); color: #93afc1; font: 9px/1.55 var(--font-geist-mono), monospace; }
+.proxy-warning b { display: block; margin-bottom: 3px; color: var(--blue); font-weight: 500; letter-spacing: .09em; }
 .strategy-card li strong { display: block; color: inherit; font-size: 10px; font-weight: 500; }
 .strategy-card li small { display: block; margin-top: 4px; color: #667169; font-size: 9px; line-height: 1.4; }
 .strategy-card li.done small { color: #92a097; }

@@ -460,6 +460,20 @@ type XausIntradayResponse = {
   points?: { t?: number; p?: number }[];
 };
 
+type GoldApiResponse = {
+  price?: number;
+  updatedAt?: string;
+};
+
+type KrakenOhlcRow = [number, string, string, string, string, string, string, number];
+
+type KrakenOhlcResponse = {
+  error?: string[];
+  result?: Record<string, KrakenOhlcRow[] | number>;
+};
+
+type HistorySource = 'none' | 'xaus' | 'paxg-proxy';
+
 type FrankfurterHistoryResponse = {
   rates?: Record<string, Record<string, number>>;
 };
@@ -519,6 +533,22 @@ function xausPointsToCandles(points: { t?: number; p?: number }[]): Candle[] {
   });
 }
 
+function krakenPaxgToCandles(payload: KrakenOhlcResponse): Candle[] {
+  if (payload.error?.length || !payload.result) return [];
+  const pair = Object.entries(payload.result).find(([key, value]) => key !== 'last' && Array.isArray(value));
+  if (!pair || !Array.isArray(pair[1])) return [];
+  return (pair[1] as KrakenOhlcRow[]).flatMap((row) => {
+    const time = Number(row[0]) * 1_000;
+    const open = Number(row[1]);
+    const high = Number(row[2]);
+    const low = Number(row[3]);
+    const close = Number(row[4]);
+    return [time, open, high, low, close].every(Number.isFinite)
+      ? [{ time, open, high, low, close }]
+      : [];
+  });
+}
+
 function buildEvents(candles: Candle[], analysis: Analysis): DetectionEvent[] {
   const events: DetectionEvent[] = [];
   analysis.sweeps.forEach((event) => events.push({
@@ -559,7 +589,8 @@ export default function Home() {
   const [focusMode, setFocusMode] = useState<FocusMode | 'custom'>('clean');
   const [layers, setLayers] = useState<ChartLayers>(FOCUS_PRESETS.clean);
   const [panelOpen, setPanelOpen] = useState(true);
-  const [status, setStatus] = useState<'connecting' | 'live' | 'stale' | 'offline'>('connecting');
+  const [status, setStatus] = useState<'connecting' | 'live' | 'backup' | 'stale' | 'offline'>('connecting');
+  const [historySource, setHistorySource] = useState<HistorySource>('none');
   const [quote, setQuote] = useState<number | null>(null);
   const [previousQuote, setPreviousQuote] = useState<number | null>(null);
   const [sourceTime, setSourceTime] = useState<number | null>(null);
@@ -568,50 +599,98 @@ export default function Home() {
   const [selectedConcept, setSelectedConcept] = useState<ConceptKey>('mss');
   const [panelTab, setPanelTab] = useState<'strategy' | 'live' | 'learn'>('strategy');
   const [quizAnswer, setQuizAnswer] = useState<string | null>(null);
-  const historyLoaded = useRef(false);
+  const historyProvider = useRef<HistorySource>('none');
+  const primaryFailures = useRef(0);
+  const primaryRetryAfter = useRef(0);
   const lastQuote = useRef<number | null>(null);
 
-  const fetchQuote = useCallback(async () => {
-    try {
-      const needsHistory = !historyLoaded.current;
-      const [spotResponse, historyResponse] = await Promise.all([
-        fetch('https://xaus.com/api/v1/spot?compact=1', { cache: 'no-store' }),
-        needsHistory
-          ? fetch('https://xaus.com/api/v1/intraday?symbol=xau&hours=48', { cache: 'no-store' })
-          : Promise.resolve(null),
-      ]);
-      if (!spotResponse.ok) throw new Error('quote unavailable');
-      const spot = await spotResponse.json() as XausSpotResponse;
-      const history = historyResponse?.ok
-        ? await historyResponse.json() as XausIntradayResponse
-        : null;
-      const price = Number(spot.xau?.price);
-      if (!Number.isFinite(price)) throw new Error('invalid quote');
-      if (spot.data_state?.status === 'unavailable') throw new Error('quote unavailable');
-      const parsedSourceTime = Date.parse(spot.data_state?.as_of ?? spot.updated_at ?? '');
-      const sourceTimestamp = Number.isFinite(parsedSourceTime) ? parsedSourceTime : Date.now();
-      const historyCandles = history ? xausPointsToCandles(history.points ?? []) : undefined;
-      setPreviousQuote(lastQuote.current ?? price);
-      setQuote(price);
-      lastQuote.current = price;
-      setSourceTime(sourceTimestamp);
-      setStatus(spot.data_state?.status === 'fresh' ? 'live' : 'stale');
-      setOneMinuteCandles((current) => {
-        if (!historyLoaded.current && historyCandles?.length) {
-          historyLoaded.current = true;
-          return upsertLiveMinute(historyCandles, price, sourceTimestamp);
-        }
-        return upsertLiveMinute(current, price, sourceTimestamp);
-      });
-    } catch {
-      setStatus('offline');
+  const applyQuote = useCallback((price: number, sourceTimestamp: number, historicalCandles?: Candle[], source?: HistorySource) => {
+    setPreviousQuote(lastQuote.current ?? price);
+    setQuote(price);
+    lastQuote.current = price;
+    setSourceTime(sourceTimestamp);
+    setOneMinuteCandles((current) => {
+      if (historicalCandles?.length) return upsertLiveMinute(historicalCandles, price, sourceTimestamp);
+      return upsertLiveMinute(current, price, sourceTimestamp);
+    });
+    if (source) {
+      historyProvider.current = source;
+      setHistorySource(source);
     }
   }, []);
 
+  const fetchPrimaryFeed = useCallback(async () => {
+    const needsXausHistory = historyProvider.current !== 'xaus';
+    const [spotResponse, historyResponse] = await Promise.all([
+      fetch('https://xaus.com/api/v1/spot?compact=1', { cache: 'no-store' }),
+      needsXausHistory
+        ? fetch('https://xaus.com/api/v1/intraday?symbol=xau&hours=48', { cache: 'no-store' })
+        : Promise.resolve(null),
+    ]);
+    if (!spotResponse.ok) throw new Error('primary quote unavailable');
+    const spot = await spotResponse.json() as XausSpotResponse;
+    const history = historyResponse?.ok
+      ? await historyResponse.json() as XausIntradayResponse
+      : null;
+    const price = Number(spot.xau?.price);
+    if (!Number.isFinite(price) || spot.data_state?.status === 'unavailable') throw new Error('invalid primary quote');
+    const parsedSourceTime = Date.parse(spot.data_state?.as_of ?? spot.updated_at ?? '');
+    const sourceTimestamp = Number.isFinite(parsedSourceTime) ? parsedSourceTime : Date.now();
+    const historyCandles = history ? xausPointsToCandles(history.points ?? []) : undefined;
+    applyQuote(price, sourceTimestamp, historyCandles, historyCandles?.length ? 'xaus' : undefined);
+    setStatus(spot.data_state?.status === 'fresh' ? 'live' : 'stale');
+    primaryFailures.current = 0;
+    primaryRetryAfter.current = 0;
+  }, [applyQuote]);
+
+  const fetchBackupFeed = useCallback(async () => {
+    const needsProxyHistory = historyProvider.current === 'none';
+    const [spotResponse, proxyResponse] = await Promise.all([
+      fetch('https://api.gold-api.com/price/XAU', { cache: 'no-store' }),
+      needsProxyHistory
+        ? fetch('https://api.kraken.com/0/public/OHLC?pair=PAXGUSD&interval=5', { cache: 'no-store' })
+        : Promise.resolve(null),
+    ]);
+    if (!spotResponse.ok) throw new Error('backup quote unavailable');
+    const spot = await spotResponse.json() as GoldApiResponse;
+    const proxy = proxyResponse?.ok
+      ? await proxyResponse.json() as KrakenOhlcResponse
+      : null;
+    const price = Number(spot.price);
+    if (!Number.isFinite(price)) throw new Error('invalid backup quote');
+    const parsedSourceTime = Date.parse(spot.updatedAt ?? '');
+    const sourceTimestamp = Number.isFinite(parsedSourceTime) ? parsedSourceTime : Date.now();
+    const proxyCandles = proxy ? krakenPaxgToCandles(proxy) : undefined;
+    applyQuote(price, sourceTimestamp, proxyCandles, proxyCandles?.length ? 'paxg-proxy' : undefined);
+    setStatus('backup');
+  }, [applyQuote]);
+
+  const fetchQuote = useCallback(async () => {
+    const now = Date.now();
+    if (now >= primaryRetryAfter.current) {
+      try {
+        await fetchPrimaryFeed();
+        return;
+      } catch {
+        primaryFailures.current += 1;
+        const backoffMinutes = [5, 15, 30][Math.min(primaryFailures.current - 1, 2)];
+        primaryRetryAfter.current = now + backoffMinutes * 60_000;
+      }
+    }
+    try {
+      await fetchBackupFeed();
+    } catch {
+      setStatus('offline');
+    }
+  }, [fetchBackupFeed, fetchPrimaryFeed]);
+
   useEffect(() => {
-    fetchQuote();
+    const initialFetch = window.setTimeout(fetchQuote, 0);
     const timer = window.setInterval(fetchQuote, 30_000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearTimeout(initialFetch);
+      window.clearInterval(timer);
+    };
   }, [fetchQuote]);
 
   const fetchDxyContext = useCallback(async () => {
@@ -684,6 +763,20 @@ export default function Home() {
   const nowSession = estParts(sourceTime ?? oneMinuteCandles.at(-1)?.time ?? 0).decimal;
   const sessionName = nowSession >= 3 && nowSession < 6 ? 'LONDON WINDOW' : nowSession >= 8.5 && nowSession < 11 ? 'NEW YORK AM' : 'OFF-SESSION';
   const glossaryGroups = [...new Set(Object.values(GLOSSARY).map((item) => item.group))];
+  const feedLabel = status === 'live'
+    ? 'LIVE XAU · XAUS'
+    : status === 'backup'
+      ? 'BACKUP XAU · GOLD-API'
+      : status === 'stale'
+        ? 'STALE XAU · XAUS'
+        : status === 'offline'
+          ? 'ALL XAU FEEDS OFFLINE'
+          : 'CONNECTING XAU FEEDS';
+  const historyLabel = historySource === 'xaus'
+    ? 'XAU/USD HISTORY · XAUS'
+    : historySource === 'paxg-proxy'
+      ? 'EMERGENCY HISTORY · PAXG/USD PROXY'
+      : 'HISTORY LOADING';
 
   const applyFocus = (mode: FocusMode) => {
     setFocusMode(mode);
@@ -698,7 +791,7 @@ export default function Home() {
           <span>XAU / USD</span><strong>{formatPrice(quote ?? candles.at(-1)?.close)}</strong>
           <span className={change >= 0 ? 'market-up' : 'market-down'}>{change >= 0 ? '+' : ''}{change.toFixed(3)}%</span>
         </div>
-        <div className="live"><i className={status} /> {status === 'live' ? 'LIVE XAU FEED' : status === 'stale' ? 'STALE MARKET FEED' : status === 'offline' ? 'FEED OFFLINE' : 'LOADING MARKET FEED'}{sourceTime ? ` · ${formatTime(sourceTime)}` : ''} · {sessionName}</div>
+        <div className="live"><i className={status} /> {feedLabel}{sourceTime ? ` · ${formatTime(sourceTime)}` : ''} · {sessionName}</div>
       </header>
 
       <section className={`workspace ${panelOpen ? '' : 'panel-closed'}`}>
@@ -727,7 +820,7 @@ export default function Home() {
           </div>
 
           <div className="chart-panel">
-            <div className="panel-label"><span>PRICE DELIVERY · {TIMEFRAMES[timeframe].label}</span><span>{focusMode === 'clean' ? 'CLEAN PRICE VIEW' : `${focusMode.toUpperCase()} FOCUS · SELECT A LABEL TO LEARN`}</span></div>
+            <div className="panel-label"><span>PRICE DELIVERY · {TIMEFRAMES[timeframe].label}</span><span>{historyLabel}</span></div>
             <MarketChart candles={candles} analysis={analysis} strategy={timeframe === '5m' ? strategy : undefined} layers={layers} timeframe={timeframe} onSelect={(key) => { setSelectedConcept(key); setPanelTab('learn'); }} />
             {!candles.length && <div className="chart-empty"><span>{status === 'offline' ? 'MARKET FEED UNAVAILABLE' : 'LOADING 48 HOURS OF OBSERVED XAU/USD DATA'}</span><small>No simulated candles will be shown.</small></div>}
           </div>
@@ -757,7 +850,7 @@ export default function Home() {
           </button>
 
           <footer className="chart-note">
-            <span>DATA NOTE</span> The chart uses observed XAU/USD prices from <a href="https://xaus.com/api/" target="_blank" rel="noreferrer">XAUS</a>. The separate DXY daily reference is an FX-basket proxy derived from <a href="https://frankfurter.dev/" target="_blank" rel="noreferrer">Frankfurter</a> currency rates. DXY is displayed for context only and never changes the strategy state, A+ label, entry, stop or target. Prices are indicative, not broker-executable quotes or trade instructions.
+            <span>DATA NOTE</span> Primary XAU/USD data comes from <a href="https://xaus.com/api/" target="_blank" rel="noreferrer">XAUS</a>. During a primary outage, spot automatically switches to <a href="https://gold-api.com/docs" target="_blank" rel="noreferrer">Gold API</a>; if no XAU history is available, the chart temporarily uses Kraken PAXG/USD candles as a clearly labeled emergency proxy. Primary retries back off from 5 to 15 to 30 minutes. The separate DXY daily reference comes from <a href="https://frankfurter.dev/" target="_blank" rel="noreferrer">Frankfurter</a>. All prices are indicative, not broker-executable quotes or trade instructions.
           </footer>
         </div>
 
@@ -771,6 +864,9 @@ export default function Home() {
           {panelTab === 'strategy' ? (
             <>
               <div className="panel-heading"><span>PRICE ACTION MODEL · 1H → 5M</span><b className={isAPlus ? 'aplus' : strategy.status === 'INVALIDATED' ? 'invalid' : ''}>{isAPlus ? 'A+' : strategy.status === 'WAIT' ? 'NO TRADE' : strategy.status}</b></div>
+              {historySource === 'paxg-proxy' && (
+                <p className="proxy-warning"><b>EMERGENCY PROXY MODE</b> Structure is calculated from Kraken PAXG/USD candles. Treat every setup state as context until XAUS history returns.</p>
+              )}
               <div className="signal-card strategy-card">
                 <div className="signal-title"><span>{strategy.name}</span><strong>{strategy.headline}</strong></div>
                 <div className="bias-row"><span>DIRECTION</span><em>{strategy.direction ?? 'UNRESOLVED'}</em></div>
