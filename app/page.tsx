@@ -125,6 +125,12 @@ const GLOSSARY = {
     confirmation: 'This terminal shades 03:00–06:00 and 08:30–11:00 New York time.',
     mistake: 'Assuming the clock alone creates a valid setup.',
   },
+  dxy: {
+    group: 'Context', term: 'DXY context', short: 'DXY',
+    definition: 'The US Dollar Index tracks the dollar against a basket of major currencies. Gold often moves inversely, but that relationship is variable and can diverge.',
+    confirmation: 'Use DXY only to describe the surrounding market: rising, falling, inverse alignment or divergence. The XAU/USD setup must still confirm itself on its own chart.',
+    mistake: 'Treating a DXY move as an entry signal or allowing it to override XAU/USD liquidity, structure and confirmation.',
+  },
   tjl1: {
     group: 'Execution', term: 'TJL1 working rule', short: 'TJL1',
     definition: 'Current draft: a confirmed swing creates a level, followed by sweep, retracement and engulfing-trigger stages.',
@@ -454,6 +460,47 @@ type XausIntradayResponse = {
   points?: { t?: number; p?: number }[];
 };
 
+type FrankfurterHistoryResponse = {
+  rates?: Record<string, Record<string, number>>;
+};
+
+type DxyPoint = { date: string; value: number };
+
+function calculateDxy(rates: Record<string, number>) {
+  const eurUsd = 1 / Number(rates.EUR);
+  const usdJpy = Number(rates.JPY);
+  const gbpUsd = 1 / Number(rates.GBP);
+  const usdCad = Number(rates.CAD);
+  const usdSek = Number(rates.SEK);
+  const usdChf = Number(rates.CHF);
+  const components = [eurUsd, usdJpy, gbpUsd, usdCad, usdSek, usdChf];
+  if (components.some((value) => !Number.isFinite(value) || value <= 0)) return null;
+  return 50.14348112
+    * (eurUsd ** -0.576)
+    * (usdJpy ** 0.136)
+    * (gbpUsd ** -0.119)
+    * (usdCad ** 0.091)
+    * (usdSek ** 0.042)
+    * (usdChf ** 0.036);
+}
+
+function dxyPointsFromRates(rates: Record<string, Record<string, number>>): DxyPoint[] {
+  return Object.entries(rates).flatMap(([date, dailyRates]) => {
+    const value = calculateDxy(dailyRates);
+    return value === null ? [] : [{ date, value }];
+  }).sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function percentChange(current: number, previous: number) {
+  return previous > 0 ? ((current - previous) / previous) * 100 : 0;
+}
+
+function dxyDirection(change: number) {
+  if (change > 0.05) return 'RISING';
+  if (change < -0.05) return 'FALLING';
+  return 'FLAT';
+}
+
 function xausPointsToCandles(points: { t?: number; p?: number }[]): Candle[] {
   let previous: number | null = null;
   return points.flatMap((point) => {
@@ -516,6 +563,8 @@ export default function Home() {
   const [quote, setQuote] = useState<number | null>(null);
   const [previousQuote, setPreviousQuote] = useState<number | null>(null);
   const [sourceTime, setSourceTime] = useState<number | null>(null);
+  const [dxySeries, setDxySeries] = useState<DxyPoint[]>([]);
+  const [dxyStatus, setDxyStatus] = useState<'loading' | 'ready' | 'offline'>('loading');
   const [selectedConcept, setSelectedConcept] = useState<ConceptKey>('mss');
   const [panelTab, setPanelTab] = useState<'strategy' | 'live' | 'learn'>('strategy');
   const [quizAnswer, setQuizAnswer] = useState<string | null>(null);
@@ -565,6 +614,33 @@ export default function Home() {
     return () => window.clearInterval(timer);
   }, [fetchQuote]);
 
+  const fetchDxyContext = useCallback(async () => {
+    try {
+      const end = new Date();
+      const start = new Date(end);
+      start.setUTCDate(start.getUTCDate() - 42);
+      const startDate = start.toISOString().slice(0, 10);
+      const response = await fetch(`https://api.frankfurter.dev/v1/${startDate}..?base=USD&symbols=EUR,JPY,GBP,CAD,SEK,CHF`, { cache: 'no-store' });
+      if (!response.ok) throw new Error('DXY context unavailable');
+      const payload = await response.json() as FrankfurterHistoryResponse;
+      const points = dxyPointsFromRates(payload.rates ?? {});
+      if (points.length < 2) throw new Error('insufficient DXY context');
+      setDxySeries(points);
+      setDxyStatus('ready');
+    } catch {
+      setDxyStatus('offline');
+    }
+  }, []);
+
+  useEffect(() => {
+    const initialTimer = window.setTimeout(fetchDxyContext, 0);
+    const refreshTimer = window.setInterval(fetchDxyContext, 6 * 60 * 60 * 1_000);
+    return () => {
+      window.clearTimeout(initialTimer);
+      window.clearInterval(refreshTimer);
+    };
+  }, [fetchDxyContext]);
+
   const candlesByTimeframe = useMemo(() => ({
     '1m': oneMinuteCandles,
     '5m': aggregateCandles(oneMinuteCandles, TIMEFRAMES['5m'].interval),
@@ -578,6 +654,24 @@ export default function Home() {
     () => evaluatePriceActionStrategy(candlesByTimeframe['5m'], fiveMinuteAnalysis, hourlyAnalysis.trend),
     [candlesByTimeframe, fiveMinuteAnalysis, hourlyAnalysis.trend],
   );
+  const dxyContext = useMemo(() => {
+    const latest = dxySeries.at(-1);
+    if (!latest) return null;
+    const fiveSessionBase = dxySeries.at(-6) ?? dxySeries[0];
+    const twentySessionBase = dxySeries.at(-21) ?? dxySeries[0];
+    const fiveSessionChange = percentChange(latest.value, fiveSessionBase.value);
+    const twentySessionChange = percentChange(latest.value, twentySessionBase.value);
+    const direction = dxyDirection(fiveSessionChange);
+    let relationship = 'XAU UNRESOLVED';
+    if (direction !== 'FLAT' && hourlyAnalysis.trend !== 'neutral') {
+      const inverseAlignment = (direction === 'RISING' && hourlyAnalysis.trend === 'bearish')
+        || (direction === 'FALLING' && hourlyAnalysis.trend === 'bullish');
+      relationship = inverseAlignment ? 'INVERSE ALIGNMENT' : 'DIVERGENCE';
+    } else if (direction === 'FLAT') {
+      relationship = 'NO CLEAR DXY MOVE';
+    }
+    return { latest, fiveSessionChange, twentySessionChange, direction, relationship };
+  }, [dxySeries, hourlyAnalysis.trend]);
   const events = useMemo(() => buildEvents(candles, analysis), [candles, analysis]);
   const concept = GLOSSARY[selectedConcept];
   const latestSetup = analysis.setups.at(-1);
@@ -653,8 +747,17 @@ export default function Home() {
             </button>
           </div>
 
+          <button className="dxy-context" onClick={() => { setSelectedConcept('dxy'); setPanelTab('learn'); }}>
+            <span className="dxy-title">DXY DAILY CONTEXT<small>OBSERVATION ONLY · EXCLUDED FROM STRATEGY LOGIC</small></span>
+            <span><small>REFERENCE</small><strong>{dxyContext ? dxyContext.latest.value.toFixed(2) : dxyStatus === 'offline' ? 'UNAVAILABLE' : 'LOADING'}</strong></span>
+            <span><small>5-SESSION MOVE</small><strong className={dxyContext?.fiveSessionChange && dxyContext.fiveSessionChange < 0 ? 'market-down' : 'market-up'}>{dxyContext ? `${dxyContext.fiveSessionChange >= 0 ? '+' : ''}${dxyContext.fiveSessionChange.toFixed(2)}% · ${dxyContext.direction}` : '—'}</strong></span>
+            <span><small>20-SESSION MOVE</small><strong>{dxyContext ? `${dxyContext.twentySessionChange >= 0 ? '+' : ''}${dxyContext.twentySessionChange.toFixed(2)}%` : '—'}</strong></span>
+            <span><small>WITH XAU 1H</small><strong>{dxyContext?.relationship ?? 'WAITING FOR DATA'}</strong></span>
+            <span className="dxy-date">{dxyContext ? `FX-BASKET PROXY · ${dxyContext.latest.date}` : 'DAILY REFERENCE FEED'}</span>
+          </button>
+
           <footer className="chart-note">
-            <span>DATA NOTE</span> The chart now uses observed XAU/USD prices from <a href="https://xaus.com/api/" target="_blank" rel="noreferrer">XAUS</a>: up to 48 hours sampled about every two minutes, plus a refreshed spot observation every 30 seconds. No synthetic market candles are displayed. Prices are indicative, not broker-executable quotes or trade instructions.
+            <span>DATA NOTE</span> The chart uses observed XAU/USD prices from <a href="https://xaus.com/api/" target="_blank" rel="noreferrer">XAUS</a>. The separate DXY daily reference is an FX-basket proxy derived from <a href="https://frankfurter.dev/" target="_blank" rel="noreferrer">Frankfurter</a> currency rates. DXY is displayed for context only and never changes the strategy state, A+ label, entry, stop or target. Prices are indicative, not broker-executable quotes or trade instructions.
           </footer>
         </div>
 
