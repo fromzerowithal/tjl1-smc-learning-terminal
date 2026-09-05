@@ -15,7 +15,7 @@ import {
   createDemoAccount,
   demoAccountEquity,
   demoBotGate,
-  DEMO_BOT_RULES,
+  CHALLENGE_LEVELS,
   processDemoBot,
   restoreDemoAccount,
   type DemoAccount,
@@ -32,15 +32,13 @@ const MARKETS = {
     pairLabel: 'XAU / USD',
     chartLabel: 'XAU/USD',
     unit: 'XAU',
-    demoMaxUnits: 100,
-    storageKey: 'tjl1-demo-bot-v1',
+    storageKey: 'tjl1-challenge-bot-xau-v2',
   },
   btc: {
     pairLabel: 'BTC / USD',
     chartLabel: 'BTC/USD',
     unit: 'BTC',
-    demoMaxUnits: 1,
-    storageKey: 'tjl1-demo-bot-btc-v1',
+    storageKey: 'tjl1-challenge-bot-btc-v2',
   },
 } as const;
 
@@ -883,6 +881,8 @@ export default function Home() {
   const demoWinRate = demoAccount.trades.length
     ? (demoAccount.trades.filter((trade) => trade.pnl > 0).length / demoAccount.trades.length) * 100
     : 0;
+  const challengeLevel = CHALLENGE_LEVELS[demoAccount.challengeLevel - 1] ?? CHALLENGE_LEVELS[0];
+  const challengeFinishBalance = CHALLENGE_LEVELS.at(-1)!.startingBalance + CHALLENGE_LEVELS.at(-1)!.profitGoal;
   const demoGate = demoBotGate({
     account: demoAccount,
     strategy: demoStrategy,
@@ -904,12 +904,11 @@ export default function Home() {
           timestamp: marketTimestamp || Date.now(),
           trustedForEntry: trustedForDemoEntry,
           trustedHistory: historySource === trustedHistorySource,
-          maxUnits: marketConfig.demoMaxUnits,
         }),
       }));
     }, 0);
     return () => window.clearTimeout(processTimer);
-  }, [completedFiveMinuteCandles, demoAccount.enabled, demoAccount.position?.id, demoMark, demoStrategy, historySource, marketConfig.demoMaxUnits, marketId, marketTimestamp, trustedForDemoEntry, trustedHistorySource]);
+  }, [completedFiveMinuteCandles, demoAccount.enabled, demoAccount.position?.id, demoMark, demoStrategy, historySource, marketId, marketTimestamp, trustedForDemoEntry, trustedHistorySource]);
   const dxyContext = useMemo(() => {
     const latest = dxySeries.at(-1);
     if (!latest) return null;
@@ -982,6 +981,7 @@ export default function Home() {
   };
 
   const toggleDemoBot = () => {
+    if (demoAccount.challengeState !== 'ACTIVE') return;
     setDemoAccounts((current) => ({
       ...current,
       [marketId]: {
@@ -1000,7 +1000,7 @@ export default function Home() {
   };
 
   const resetDemoAccount = () => {
-    if (!window.confirm(`Reset the $10,000 ${marketConfig.unit} demo account and erase its local trade journal?`)) return;
+    if (!window.confirm(`Reset the $20 ${marketConfig.unit} challenge and erase its local trade journal?`)) return;
     setDemoAccounts((current) => ({
       ...current,
       [marketId]: createDemoAccount(marketTimestamp || Date.now()),
@@ -1137,18 +1137,19 @@ export default function Home() {
             </>
           ) : panelTab === 'bot' ? (
             <>
-              <div className="panel-heading"><span>{marketConfig.unit} DEMO EXECUTION</span><b className={demoAccount.enabled ? 'bot-armed' : ''}>{demoAccount.enabled ? 'ARMED' : 'OFF'}</b></div>
-              <div className="demo-lock"><b>SIMULATION ONLY · {marketConfig.chartLabel}</b><span>Separate virtual ledger · no broker connection · no real orders · no account credentials</span></div>
+              <div className="panel-heading"><span>{marketConfig.unit} $20 CHALLENGE</span><b className={demoAccount.enabled ? 'bot-armed' : ''}>{demoAccount.challengeState === 'ACTIVE' ? demoAccount.enabled ? 'ARMED' : 'OFF' : demoAccount.challengeState}</b></div>
+              <div className="challenge-warning"><b>HIGH-RISK EXPERIMENT · 30% GROWTH TARGET</b><span>This progression can lose the full $20 challenge balance very quickly. Simulation only—never broker execution.</span></div>
+              <div className="demo-lock"><b>SMC ENTRY FILTER · {marketConfig.chartLabel}</b><span>Only a fresh completed Sweep → MSS → Retest → Engulfing sequence can create a virtual position.</span></div>
 
               <div className="demo-metrics">
                 <span><small>BALANCE</small><strong>{formatMoney(demoAccount.balance)}</strong></span>
                 <span><small>EQUITY</small><strong>{formatMoney(demoEquity)}</strong></span>
-                <span><small>DAY P/L</small><strong className={demoAccount.dailyPnl >= 0 ? 'market-up' : 'market-down'}>{formatMoney(demoAccount.dailyPnl)}</strong></span>
-                <span><small>WIN RATE</small><strong>{demoAccount.trades.length ? `${demoWinRate.toFixed(0)}%` : '—'}</strong></span>
+                <span><small>LEVEL</small><strong>{demoAccount.challengeLevel} / {CHALLENGE_LEVELS.length}</strong></span>
+                <span><small>CHALLENGE FINISH</small><strong>{formatMoney(challengeFinishBalance)}</strong></span>
               </div>
 
               <div className="demo-controls">
-                <button className={demoAccount.enabled ? 'disarm' : 'arm'} onClick={toggleDemoBot}>{demoAccount.enabled ? 'DISARM DEMO BOT' : 'ARM DEMO BOT'}</button>
+                <button disabled={demoAccount.challengeState !== 'ACTIVE'} className={demoAccount.enabled ? 'disarm' : 'arm'} onClick={toggleDemoBot}>{demoAccount.challengeState === 'ACTIVE' ? demoAccount.enabled ? 'DISARM DEMO BOT' : 'ARM DEMO BOT' : 'RESET CHALLENGE TO CONTINUE'}</button>
                 {demoAccount.position && <button className="close-demo" onClick={manuallyCloseDemoPosition}>CLOSE DEMO POSITION</button>}
               </div>
 
@@ -1161,23 +1162,36 @@ export default function Home() {
               <div className="panel-heading"><span>OPEN DEMO POSITION</span><small>{demoAccount.position ? '1 / 1' : 'NONE'}</small></div>
               {demoAccount.position ? (
                 <div className="demo-position">
-                  <div><span>{demoAccount.position.direction}</span><strong>{demoAccount.position.units.toFixed(marketId === 'btc' ? 6 : 3)} {marketConfig.unit} units</strong></div>
+                  <div><span>LEVEL {demoAccount.position.challengeLevel} · {demoAccount.position.direction}</span><strong>{demoAccount.position.referenceLot.toFixed(2)} reference lot</strong></div>
                   <div className="position-levels">
                     <span><small>ENTRY</small>{formatPrice(demoAccount.position.entry)}</span>
                     <span><small>STOP</small>{formatPrice(demoAccount.position.stop)}</span>
-                    <span><small>5R TARGET</small>{formatPrice(demoAccount.position.target)}</span>
+                    <span><small>LEVEL TARGET</small>{formatPrice(demoAccount.position.target)}</span>
                     <span><small>FLOATING</small><b className={demoFloatingPnl >= 0 ? 'market-up' : 'market-down'}>{formatMoney(demoFloatingPnl)}</b></span>
                   </div>
                 </div>
               ) : <p className="demo-empty">No simulated position is open.</p>}
 
-              <div className="panel-heading"><span>FIXED RISK GUARDRAILS</span><small>Cannot be changed</small></div>
+              <div className="panel-heading"><span>CURRENT LEVEL PLAN</span><small>From your 30-level table</small></div>
               <div className="demo-rules">
-                <span><small>RISK / TRADE</small><strong>{DEMO_BOT_RULES.riskPercent}%</strong></span>
-                <span><small>DAILY LOSS LOCK</small><strong>{DEMO_BOT_RULES.dailyLossPercent}%</strong></span>
-                <span><small>TRADES / DAY</small><strong>{demoAccount.tradesToday} / {DEMO_BOT_RULES.maxTradesPerDay}</strong></span>
-                <span><small>REWARD / RISK</small><strong>{DEMO_BOT_RULES.rewardRisk}R</strong></span>
+                <span><small>STARTING BALANCE</small><strong>{formatMoney(challengeLevel.startingBalance)}</strong></span>
+                <span><small>PLANNED MAX LOSS</small><strong>{formatMoney(challengeLevel.risk)}</strong></span>
+                <span><small>PROFIT GOAL</small><strong>{formatMoney(challengeLevel.profitGoal)}</strong></span>
+                <span><small>REFERENCE</small><strong>{challengeLevel.pips} pips · {challengeLevel.referenceLot.toFixed(2)} lot</strong></span>
+                <span><small>TRADES TODAY</small><strong>{demoAccount.tradesToday} / UNLIMITED</strong></span>
+                <span><small>WIN RATE</small><strong>{demoAccount.trades.length ? `${demoWinRate.toFixed(0)}%` : '—'}</strong></span>
               </div>
+
+              <div className="panel-heading"><span>30-LEVEL LADDER</span><small>Current row highlighted</small></div>
+              <div className="challenge-ladder" role="region" aria-label="Thirty-level challenge plan" tabIndex={0}>
+                <div className="challenge-row challenge-head"><span>LVL</span><span>START</span><span>RISK</span><span>GOAL</span><span>REF LOT</span></div>
+                {CHALLENGE_LEVELS.map((level) => (
+                  <div key={level.level} className={`challenge-row ${level.level === demoAccount.challengeLevel ? 'current' : ''}`}>
+                    <span>{level.level}</span><span>{formatMoney(level.startingBalance)}</span><span>{formatMoney(level.risk)}</span><span>{formatMoney(level.profitGoal)}</span><span>{level.referenceLot.toFixed(2)}</span>
+                  </div>
+                ))}
+              </div>
+              <p className="challenge-note">The simulator uses the table’s exact dollar risk and dollar profit goal while keeping the SMC structural stop. The 20-pip and lot-size figures are displayed as plan references because pip and contract values differ between XAU/USD, BTC/USD and brokers.</p>
 
               <div className="panel-heading"><span>DEMO TRADE JOURNAL</span><small>{demoAccount.trades.length} closed</small></div>
               <div className="demo-journal">
@@ -1190,8 +1204,8 @@ export default function Home() {
                 {!demoAccount.trades.length && <p>No closed demo trades yet.</p>}
               </div>
 
-              <button className="reset-demo" onClick={resetDemoAccount}>RESET $10,000 {marketConfig.unit} DEMO ACCOUNT</button>
-              <p className="risk-note">Each market has a separate device-local demo ledger. The simulator runs only while this page is open, never connects to MT5, and automatically reopens disarmed after a refresh.</p>
+              <button className="reset-demo" onClick={resetDemoAccount}>RESET $20 {marketConfig.unit} CHALLENGE</button>
+              <p className="risk-note">Unlimited means unlimited fresh qualifying setups; the bot still blocks duplicate signals and allows only one position at a time. Each market has a separate device-local challenge. It runs only while this page is open and never connects to MT5.</p>
             </>
           ) : panelTab === 'live' ? (
             <>

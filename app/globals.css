@@ -127,6 +127,9 @@ button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .demo-lock { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; padding: 10px 12px; border: 1px solid rgba(97,169,216,.38); background: rgba(97,169,216,.05); }
 .demo-lock b { color: var(--blue); font: 10px var(--font-geist-mono), monospace; font-weight: 500; letter-spacing: .11em; }
 .demo-lock span { color: #7f979f; font-size: 9px; line-height: 1.4; }
+.challenge-warning { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; padding: 11px 12px; border: 1px solid rgba(240,107,92,.55); background: rgba(240,107,92,.07); }
+.challenge-warning b { color: var(--red); font: 10px var(--font-geist-mono), monospace; font-weight: 500; letter-spacing: .1em; }
+.challenge-warning span { color: #c68e87; font-size: 9px; line-height: 1.45; }
 .demo-metrics { display: grid; grid-template-columns: repeat(2, 1fr); margin-bottom: 12px; border: 1px solid var(--line); background: var(--panel-2); }
 .demo-metrics > span { min-width: 0; padding: 12px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .demo-metrics > span:nth-child(2n) { border-right: 0; }
@@ -138,6 +141,7 @@ button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .demo-controls button.arm { border-color: var(--green); color: var(--green); background: rgba(98,211,148,.045); }
 .demo-controls button.disarm { border-color: var(--amber); color: var(--amber); }
 .demo-controls button.close-demo { border-color: var(--red); color: var(--red); }
+.demo-controls button:disabled { cursor: not-allowed; border-color: var(--line); color: #59645c; background: transparent; }
 .demo-controls button:hover, .reset-demo:hover { background: var(--panel-3); color: var(--ink); }
 .bot-gate { margin-bottom: 12px; padding: 12px; border: 1px solid var(--line); background: var(--panel-2); }
 .bot-gate > span { color: var(--muted); font: 10px var(--font-geist-mono), monospace; letter-spacing: .11em; }
@@ -160,6 +164,15 @@ button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .demo-rules > span:nth-child(2n) { border-right: 0; }
 .demo-rules > span:nth-last-child(-n+2) { border-bottom: 0; }
 .demo-rules strong { color: var(--amber); font: 11px var(--font-geist-mono), monospace; font-weight: 500; }
+.challenge-ladder { max-height: 215px; overflow-y: auto; margin-bottom: 9px; border: 1px solid var(--line); background: var(--panel-2); scrollbar-color: var(--line-bright) transparent; }
+.challenge-row { display: grid; grid-template-columns: 30px repeat(4, minmax(0, 1fr)); align-items: center; min-height: 31px; border-bottom: 1px solid var(--line); color: #8d9a90; font: 8px var(--font-geist-mono), monospace; }
+.challenge-row:last-child { border-bottom: 0; }
+.challenge-row span { min-width: 0; padding: 7px 5px; text-align: right; }
+.challenge-row span:first-child { text-align: center; color: var(--muted); }
+.challenge-row.challenge-head { position: sticky; top: 0; z-index: 1; background: #141b16; color: #718078; letter-spacing: .05em; }
+.challenge-row.current { background: rgba(211,166,70,.09); color: var(--amber); box-shadow: inset 2px 0 var(--amber); }
+.challenge-row.current span:first-child { color: var(--amber); }
+.challenge-note { margin: 0 0 13px; color: #718078; font-size: 8px; line-height: 1.5; }
 .demo-journal { max-height: 190px; overflow-y: auto; margin-bottom: 10px; border: 1px solid var(--line); background: var(--panel-2); scrollbar-color: var(--line-bright) transparent; }
 .demo-journal > div { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 11px; border-bottom: 1px solid var(--line); }
 .demo-journal > div:last-child { border-bottom: 0; }
