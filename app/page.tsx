@@ -10,6 +10,16 @@ import {
   type Candle,
   type PriceActionStrategy,
 } from '../lib/smc';
+import {
+  closeDemoPosition,
+  createDemoAccount,
+  demoAccountEquity,
+  demoBotGate,
+  DEMO_BOT_RULES,
+  processDemoBot,
+  restoreDemoAccount,
+  type DemoAccount,
+} from '../lib/demo-bot';
 
 const TIMEFRAMES = {
   '1m': { label: '2M', interval: 60_000, bars: 72 },
@@ -17,7 +27,25 @@ const TIMEFRAMES = {
   '1h': { label: '1H', interval: 60 * 60_000, bars: 48 },
 } as const;
 
+const MARKETS = {
+  xau: {
+    pairLabel: 'XAU / USD',
+    chartLabel: 'XAU/USD',
+    unit: 'XAU',
+    demoMaxUnits: 100,
+    storageKey: 'tjl1-demo-bot-v1',
+  },
+  btc: {
+    pairLabel: 'BTC / USD',
+    chartLabel: 'BTC/USD',
+    unit: 'BTC',
+    demoMaxUnits: 1,
+    storageKey: 'tjl1-demo-bot-btc-v1',
+  },
+} as const;
+
 type Timeframe = keyof typeof TIMEFRAMES;
+type MarketId = keyof typeof MARKETS;
 type Layer = 'structure' | 'liquidity' | 'delivery' | 'tjl1';
 type FocusMode = 'clean' | 'structure' | 'liquidity' | 'entry';
 type ConceptKey = keyof typeof GLOSSARY;
@@ -127,9 +155,9 @@ const GLOSSARY = {
   },
   dxy: {
     group: 'Context', term: 'DXY context', short: 'DXY',
-    definition: 'The US Dollar Index tracks the dollar against a basket of major currencies. Gold often moves inversely, but that relationship is variable and can diverge.',
-    confirmation: 'Use DXY only to describe the surrounding market: rising, falling, inverse alignment or divergence. The XAU/USD setup must still confirm itself on its own chart.',
-    mistake: 'Treating a DXY move as an entry signal or allowing it to override XAU/USD liquidity, structure and confirmation.',
+    definition: 'The US Dollar Index tracks the dollar against a basket of major currencies. Gold and Bitcoin can move inversely to it, but both relationships vary and can diverge.',
+    confirmation: 'Use DXY only to describe the surrounding market: rising, falling, inverse alignment or divergence. Every setup must still confirm itself on its own chart.',
+    mistake: 'Treating a DXY move as an entry signal or allowing it to override the selected market’s liquidity, structure and confirmation.',
   },
   tjl1: {
     group: 'Execution', term: 'TJL1 working rule', short: 'TJL1',
@@ -174,6 +202,11 @@ function formatPrice(price: number | null | undefined) {
   return Number.isFinite(price) ? Number(price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—';
 }
 
+function formatMoney(value: number) {
+  const amount = Math.abs(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return `${value < 0 ? '-' : ''}$${amount}`;
+}
+
 function formatTime(time: number, withDate = false) {
   return new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York',
@@ -188,6 +221,7 @@ function MarketChart({
   strategy,
   layers,
   timeframe,
+  marketLabel,
   onSelect,
 }: {
   candles: Candle[];
@@ -195,6 +229,7 @@ function MarketChart({
   strategy?: PriceActionStrategy;
   layers: ChartLayers;
   timeframe: Timeframe;
+  marketLabel: string;
   onSelect: (concept: ConceptKey) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -439,7 +474,7 @@ function MarketChart({
     if (target) onSelect(target.concept);
   };
 
-  return <canvas ref={canvasRef} className="market-chart" onClick={handleClick} aria-label="Automatically annotated XAU/USD Smart Money Concepts chart" />;
+  return <canvas ref={canvasRef} className="market-chart" onClick={handleClick} aria-label={`Automatically annotated ${marketLabel} Smart Money Concepts chart`} />;
 }
 
 type DetectionEvent = { index: number; concept: ConceptKey; label: string; detail: string; time: number };
@@ -472,7 +507,23 @@ type KrakenOhlcResponse = {
   result?: Record<string, KrakenOhlcRow[] | number>;
 };
 
-type HistorySource = 'none' | 'xaus' | 'paxg-proxy';
+type KrakenTickerRow = { c?: string[] };
+
+type KrakenTickerResponse = {
+  error?: string[];
+  result?: Record<string, KrakenTickerRow>;
+};
+
+type HistorySource = 'none' | 'xaus' | 'paxg-proxy' | 'kraken-btc';
+type FeedStatus = 'connecting' | 'live' | 'backup' | 'stale' | 'offline';
+type MarketFeed = {
+  oneMinuteCandles: Candle[];
+  status: FeedStatus;
+  historySource: HistorySource;
+  quote: number | null;
+  previousQuote: number | null;
+  sourceTime: number | null;
+};
 
 type FrankfurterHistoryResponse = {
   rates?: Record<string, Record<string, number>>;
@@ -533,7 +584,7 @@ function xausPointsToCandles(points: { t?: number; p?: number }[]): Candle[] {
   });
 }
 
-function krakenPaxgToCandles(payload: KrakenOhlcResponse): Candle[] {
+function krakenOhlcToCandles(payload: KrakenOhlcResponse): Candle[] {
   if (payload.error?.length || !payload.result) return [];
   const pair = Object.entries(payload.result).find(([key, value]) => key !== 'last' && Array.isArray(value));
   if (!pair || !Array.isArray(pair[1])) return [];
@@ -547,6 +598,24 @@ function krakenPaxgToCandles(payload: KrakenOhlcResponse): Candle[] {
       ? [{ time, open, high, low, close }]
       : [];
   });
+}
+
+function krakenTickerPrice(payload: KrakenTickerResponse) {
+  if (payload.error?.length || !payload.result) return null;
+  const ticker = Object.values(payload.result)[0];
+  const price = Number(ticker?.c?.[0]);
+  return Number.isFinite(price) ? price : null;
+}
+
+function createMarketFeed(): MarketFeed {
+  return {
+    oneMinuteCandles: [],
+    status: 'connecting',
+    historySource: 'none',
+    quote: null,
+    previousQuote: null,
+    sourceTime: null,
+  };
 }
 
 function buildEvents(candles: Candle[], analysis: Analysis): DetectionEvent[] {
@@ -584,43 +653,74 @@ function buildEvents(candles: Candle[], analysis: Analysis): DetectionEvent[] {
 }
 
 export default function Home() {
-  const [oneMinuteCandles, setOneMinuteCandles] = useState<Candle[]>([]);
+  const [marketId, setMarketId] = useState<MarketId>('xau');
+  const [marketFeeds, setMarketFeeds] = useState<Record<MarketId, MarketFeed>>(() => ({
+    xau: createMarketFeed(),
+    btc: createMarketFeed(),
+  }));
   const [timeframe, setTimeframe] = useState<Timeframe>('5m');
   const [focusMode, setFocusMode] = useState<FocusMode | 'custom'>('clean');
   const [layers, setLayers] = useState<ChartLayers>(FOCUS_PRESETS.clean);
   const [panelOpen, setPanelOpen] = useState(true);
-  const [status, setStatus] = useState<'connecting' | 'live' | 'backup' | 'stale' | 'offline'>('connecting');
-  const [historySource, setHistorySource] = useState<HistorySource>('none');
-  const [quote, setQuote] = useState<number | null>(null);
-  const [previousQuote, setPreviousQuote] = useState<number | null>(null);
-  const [sourceTime, setSourceTime] = useState<number | null>(null);
   const [dxySeries, setDxySeries] = useState<DxyPoint[]>([]);
   const [dxyStatus, setDxyStatus] = useState<'loading' | 'ready' | 'offline'>('loading');
   const [selectedConcept, setSelectedConcept] = useState<ConceptKey>('mss');
-  const [panelTab, setPanelTab] = useState<'strategy' | 'live' | 'learn'>('strategy');
+  const [panelTab, setPanelTab] = useState<'strategy' | 'bot' | 'live' | 'learn'>('strategy');
   const [quizAnswer, setQuizAnswer] = useState<string | null>(null);
-  const historyProvider = useRef<HistorySource>('none');
+  const [demoAccounts, setDemoAccounts] = useState<Record<MarketId, DemoAccount>>(() => ({
+    xau: createDemoAccount(),
+    btc: createDemoAccount(),
+  }));
+  const historyProvider = useRef<Record<MarketId, HistorySource>>({ xau: 'none', btc: 'none' });
   const primaryFailures = useRef(0);
   const primaryRetryAfter = useRef(0);
-  const lastQuote = useRef<number | null>(null);
+  const demoHydrated = useRef(false);
+  const marketConfig = MARKETS[marketId];
+  const activeFeed = marketFeeds[marketId];
+  const { oneMinuteCandles, status, historySource, quote, previousQuote, sourceTime } = activeFeed;
+  const demoAccount = demoAccounts[marketId];
 
-  const applyQuote = useCallback((price: number, sourceTimestamp: number, historicalCandles?: Candle[], source?: HistorySource) => {
-    setPreviousQuote(lastQuote.current ?? price);
-    setQuote(price);
-    lastQuote.current = price;
-    setSourceTime(sourceTimestamp);
-    setOneMinuteCandles((current) => {
-      if (historicalCandles?.length) return upsertLiveMinute(historicalCandles, price, sourceTimestamp);
-      return upsertLiveMinute(current, price, sourceTimestamp);
-    });
-    if (source) {
-      historyProvider.current = source;
-      setHistorySource(source);
-    }
+  useEffect(() => {
+    const loadTimer = window.setTimeout(() => {
+      setDemoAccounts({
+        xau: restoreDemoAccount(window.localStorage.getItem(MARKETS.xau.storageKey)),
+        btc: restoreDemoAccount(window.localStorage.getItem(MARKETS.btc.storageKey)),
+      });
+      demoHydrated.current = true;
+    }, 0);
+    return () => window.clearTimeout(loadTimer);
   }, []);
 
+  useEffect(() => {
+    if (!demoHydrated.current) return;
+    window.localStorage.setItem(MARKETS.xau.storageKey, JSON.stringify(demoAccounts.xau));
+    window.localStorage.setItem(MARKETS.btc.storageKey, JSON.stringify(demoAccounts.btc));
+  }, [demoAccounts]);
+
+  const updateFeed = useCallback((targetMarket: MarketId, update: (current: MarketFeed) => MarketFeed) => {
+    setMarketFeeds((current) => ({ ...current, [targetMarket]: update(current[targetMarket]) }));
+  }, []);
+
+  const setFeedStatus = useCallback((targetMarket: MarketId, nextStatus: FeedStatus) => {
+    updateFeed(targetMarket, (current) => ({ ...current, status: nextStatus }));
+  }, [updateFeed]);
+
+  const applyQuote = useCallback((targetMarket: MarketId, price: number, sourceTimestamp: number, historicalCandles?: Candle[], source?: HistorySource) => {
+    updateFeed(targetMarket, (current) => ({
+      ...current,
+      previousQuote: current.quote ?? price,
+      quote: price,
+      sourceTime: sourceTimestamp,
+      oneMinuteCandles: upsertLiveMinute(historicalCandles?.length ? historicalCandles : current.oneMinuteCandles, price, sourceTimestamp),
+      historySource: source ?? current.historySource,
+    }));
+    if (source) {
+      historyProvider.current[targetMarket] = source;
+    }
+  }, [updateFeed]);
+
   const fetchPrimaryFeed = useCallback(async () => {
-    const needsXausHistory = historyProvider.current !== 'xaus';
+    const needsXausHistory = historyProvider.current.xau !== 'xaus';
     const [spotResponse, historyResponse] = await Promise.all([
       fetch('https://xaus.com/api/v1/spot?compact=1', { cache: 'no-store' }),
       needsXausHistory
@@ -637,14 +737,14 @@ export default function Home() {
     const parsedSourceTime = Date.parse(spot.data_state?.as_of ?? spot.updated_at ?? '');
     const sourceTimestamp = Number.isFinite(parsedSourceTime) ? parsedSourceTime : Date.now();
     const historyCandles = history ? xausPointsToCandles(history.points ?? []) : undefined;
-    applyQuote(price, sourceTimestamp, historyCandles, historyCandles?.length ? 'xaus' : undefined);
-    setStatus(spot.data_state?.status === 'fresh' ? 'live' : 'stale');
+    applyQuote('xau', price, sourceTimestamp, historyCandles, historyCandles?.length ? 'xaus' : undefined);
+    setFeedStatus('xau', spot.data_state?.status === 'fresh' ? 'live' : 'stale');
     primaryFailures.current = 0;
     primaryRetryAfter.current = 0;
-  }, [applyQuote]);
+  }, [applyQuote, setFeedStatus]);
 
   const fetchBackupFeed = useCallback(async () => {
-    const needsProxyHistory = historyProvider.current === 'none';
+    const needsProxyHistory = historyProvider.current.xau === 'none';
     const [spotResponse, proxyResponse] = await Promise.all([
       fetch('https://api.gold-api.com/price/XAU', { cache: 'no-store' }),
       needsProxyHistory
@@ -660,12 +760,12 @@ export default function Home() {
     if (!Number.isFinite(price)) throw new Error('invalid backup quote');
     const parsedSourceTime = Date.parse(spot.updatedAt ?? '');
     const sourceTimestamp = Number.isFinite(parsedSourceTime) ? parsedSourceTime : Date.now();
-    const proxyCandles = proxy ? krakenPaxgToCandles(proxy) : undefined;
-    applyQuote(price, sourceTimestamp, proxyCandles, proxyCandles?.length ? 'paxg-proxy' : undefined);
-    setStatus('backup');
-  }, [applyQuote]);
+    const proxyCandles = proxy ? krakenOhlcToCandles(proxy) : undefined;
+    applyQuote('xau', price, sourceTimestamp, proxyCandles, proxyCandles?.length ? 'paxg-proxy' : undefined);
+    setFeedStatus('xau', 'backup');
+  }, [applyQuote, setFeedStatus]);
 
-  const fetchQuote = useCallback(async () => {
+  const fetchXauQuote = useCallback(async () => {
     const now = Date.now();
     if (now >= primaryRetryAfter.current) {
       try {
@@ -680,9 +780,41 @@ export default function Home() {
     try {
       await fetchBackupFeed();
     } catch {
-      setStatus('offline');
+      setFeedStatus('xau', 'offline');
     }
-  }, [fetchBackupFeed, fetchPrimaryFeed]);
+  }, [fetchBackupFeed, fetchPrimaryFeed, setFeedStatus]);
+
+  const fetchBtcQuote = useCallback(async () => {
+    try {
+      const needsHistory = historyProvider.current.btc !== 'kraken-btc';
+      const [tickerResponse, historyResponse] = await Promise.all([
+        fetch('https://api.kraken.com/0/public/Ticker?pair=XBTUSD', { cache: 'no-store' }),
+        needsHistory
+          ? fetch('https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=5', { cache: 'no-store' })
+          : Promise.resolve(null),
+      ]);
+      if (!tickerResponse.ok) throw new Error('BTC quote unavailable');
+      const ticker = await tickerResponse.json() as KrakenTickerResponse;
+      const history = historyResponse?.ok
+        ? await historyResponse.json() as KrakenOhlcResponse
+        : null;
+      const price = krakenTickerPrice(ticker);
+      if (price === null) throw new Error('invalid BTC quote');
+      const historyCandles = history ? krakenOhlcToCandles(history) : undefined;
+      applyQuote('btc', price, Date.now(), historyCandles, historyCandles?.length ? 'kraken-btc' : undefined);
+      setFeedStatus('btc', 'live');
+    } catch {
+      setFeedStatus('btc', 'offline');
+    }
+  }, [applyQuote, setFeedStatus]);
+
+  const fetchQuote = useCallback(async () => {
+    if (marketId === 'btc') {
+      await fetchBtcQuote();
+      return;
+    }
+    await fetchXauQuote();
+  }, [fetchBtcQuote, fetchXauQuote, marketId]);
 
   useEffect(() => {
     const initialFetch = window.setTimeout(fetchQuote, 0);
@@ -733,6 +865,51 @@ export default function Home() {
     () => evaluatePriceActionStrategy(candlesByTimeframe['5m'], fiveMinuteAnalysis, hourlyAnalysis.trend),
     [candlesByTimeframe, fiveMinuteAnalysis, hourlyAnalysis.trend],
   );
+  const marketTimestamp = sourceTime ?? candlesByTimeframe['5m'].at(-1)?.time ?? 0;
+  const completedFiveMinuteCandles = useMemo(
+    () => candlesByTimeframe['5m'].filter((candle) => candle.time + TIMEFRAMES['5m'].interval <= marketTimestamp),
+    [candlesByTimeframe, marketTimestamp],
+  );
+  const completedFiveMinuteAnalysis = useMemo(() => analyze(completedFiveMinuteCandles), [completedFiveMinuteCandles]);
+  const demoStrategy = useMemo(
+    () => evaluatePriceActionStrategy(completedFiveMinuteCandles, completedFiveMinuteAnalysis, hourlyAnalysis.trend),
+    [completedFiveMinuteCandles, completedFiveMinuteAnalysis, hourlyAnalysis.trend],
+  );
+  const trustedHistorySource = marketId === 'xau' ? 'xaus' : 'kraken-btc';
+  const trustedForDemoEntry = status === 'live' && historySource === trustedHistorySource;
+  const demoMark = quote ?? candlesByTimeframe['5m'].at(-1)?.close ?? null;
+  const demoEquity = demoAccountEquity(demoAccount, demoMark);
+  const demoFloatingPnl = demoEquity - demoAccount.balance;
+  const demoWinRate = demoAccount.trades.length
+    ? (demoAccount.trades.filter((trade) => trade.pnl > 0).length / demoAccount.trades.length) * 100
+    : 0;
+  const demoGate = demoBotGate({
+    account: demoAccount,
+    strategy: demoStrategy,
+    completedCandles: completedFiveMinuteCandles,
+    quote: demoMark,
+    trustedForEntry: trustedForDemoEntry,
+    entryFeedLabel: marketId === 'xau' ? 'live XAUS' : 'live Kraken BTC/USD',
+  });
+
+  useEffect(() => {
+    const processTimer = window.setTimeout(() => {
+      setDemoAccounts((current) => ({
+        ...current,
+        [marketId]: processDemoBot({
+          account: current[marketId],
+          strategy: demoStrategy,
+          completedCandles: completedFiveMinuteCandles,
+          quote: demoMark,
+          timestamp: marketTimestamp || Date.now(),
+          trustedForEntry: trustedForDemoEntry,
+          trustedHistory: historySource === trustedHistorySource,
+          maxUnits: marketConfig.demoMaxUnits,
+        }),
+      }));
+    }, 0);
+    return () => window.clearTimeout(processTimer);
+  }, [completedFiveMinuteCandles, demoAccount.enabled, demoAccount.position?.id, demoMark, demoStrategy, historySource, marketConfig.demoMaxUnits, marketId, marketTimestamp, trustedForDemoEntry, trustedHistorySource]);
   const dxyContext = useMemo(() => {
     const latest = dxySeries.at(-1);
     if (!latest) return null;
@@ -741,7 +918,7 @@ export default function Home() {
     const fiveSessionChange = percentChange(latest.value, fiveSessionBase.value);
     const twentySessionChange = percentChange(latest.value, twentySessionBase.value);
     const direction = dxyDirection(fiveSessionChange);
-    let relationship = 'XAU UNRESOLVED';
+    let relationship = `${marketConfig.unit} UNRESOLVED`;
     if (direction !== 'FLAT' && hourlyAnalysis.trend !== 'neutral') {
       const inverseAlignment = (direction === 'RISING' && hourlyAnalysis.trend === 'bearish')
         || (direction === 'FALLING' && hourlyAnalysis.trend === 'bullish');
@@ -750,7 +927,7 @@ export default function Home() {
       relationship = 'NO CLEAR DXY MOVE';
     }
     return { latest, fiveSessionChange, twentySessionChange, direction, relationship };
-  }, [dxySeries, hourlyAnalysis.trend]);
+  }, [dxySeries, hourlyAnalysis.trend, marketConfig.unit]);
   const events = useMemo(() => buildEvents(candles, analysis), [candles, analysis]);
   const concept = GLOSSARY[selectedConcept];
   const latestSetup = analysis.setups.at(-1);
@@ -763,24 +940,71 @@ export default function Home() {
   const nowSession = estParts(sourceTime ?? oneMinuteCandles.at(-1)?.time ?? 0).decimal;
   const sessionName = nowSession >= 3 && nowSession < 6 ? 'LONDON WINDOW' : nowSession >= 8.5 && nowSession < 11 ? 'NEW YORK AM' : 'OFF-SESSION';
   const glossaryGroups = [...new Set(Object.values(GLOSSARY).map((item) => item.group))];
-  const feedLabel = status === 'live'
-    ? 'LIVE XAU · XAUS'
-    : status === 'backup'
-      ? 'BACKUP XAU · GOLD-API'
-      : status === 'stale'
-        ? 'STALE XAU · XAUS'
-        : status === 'offline'
-          ? 'ALL XAU FEEDS OFFLINE'
-          : 'CONNECTING XAU FEEDS';
+  const feedLabel = marketId === 'btc'
+    ? status === 'live' ? 'LIVE BTC · KRAKEN' : status === 'offline' ? 'BTC FEED OFFLINE' : 'CONNECTING BTC FEED'
+    : status === 'live'
+      ? 'LIVE XAU · XAUS'
+      : status === 'backup'
+        ? 'BACKUP XAU · GOLD-API'
+        : status === 'stale'
+          ? 'STALE XAU · XAUS'
+          : status === 'offline'
+            ? 'ALL XAU FEEDS OFFLINE'
+            : 'CONNECTING XAU FEEDS';
   const historyLabel = historySource === 'xaus'
     ? 'XAU/USD HISTORY · XAUS'
     : historySource === 'paxg-proxy'
       ? 'EMERGENCY HISTORY · PAXG/USD PROXY'
-      : 'HISTORY LOADING';
+      : historySource === 'kraken-btc'
+        ? 'BTC/USD HISTORY · KRAKEN'
+        : 'HISTORY LOADING';
 
   const applyFocus = (mode: FocusMode) => {
     setFocusMode(mode);
     setLayers(FOCUS_PRESETS[mode]);
+  };
+
+  const selectMarket = (nextMarket: MarketId) => {
+    if (nextMarket === marketId) return;
+    if (demoAccount.position) {
+      window.alert(`Close the open ${marketConfig.unit} demo position before switching markets.`);
+      return;
+    }
+    setDemoAccounts((current) => ({
+      ...current,
+      [marketId]: {
+        ...current[marketId],
+        enabled: false,
+        lastEvent: 'DEMO BOT DISARMED · MARKET CHANGED',
+      },
+    }));
+    setMarketId(nextMarket);
+  };
+
+  const toggleDemoBot = () => {
+    setDemoAccounts((current) => ({
+      ...current,
+      [marketId]: {
+        ...current[marketId],
+        enabled: !current[marketId].enabled,
+        lastEvent: current[marketId].enabled ? 'DEMO BOT DISARMED' : `DEMO BOT ARMED · ${marketConfig.unit}`,
+      },
+    }));
+  };
+
+  const manuallyCloseDemoPosition = () => {
+    setDemoAccounts((current) => ({
+      ...current,
+      [marketId]: closeDemoPosition(current[marketId], demoMark, marketTimestamp || Date.now()),
+    }));
+  };
+
+  const resetDemoAccount = () => {
+    if (!window.confirm(`Reset the $10,000 ${marketConfig.unit} demo account and erase its local trade journal?`)) return;
+    setDemoAccounts((current) => ({
+      ...current,
+      [marketId]: createDemoAccount(marketTimestamp || Date.now()),
+    }));
   };
 
   return (
@@ -788,7 +1012,12 @@ export default function Home() {
       <header className="topbar">
         <div className="brand"><span className="brand-mark">T1</span><span>TJL1 · SMC LAB</span></div>
         <div className="market">
-          <span>XAU / USD</span><strong>{formatPrice(quote ?? candles.at(-1)?.close)}</strong>
+          <div className="market-selector" role="group" aria-label="Select market">
+            {(Object.keys(MARKETS) as MarketId[]).map((key) => (
+              <button key={key} className={marketId === key ? 'active' : ''} aria-pressed={marketId === key} onClick={() => selectMarket(key)}>{MARKETS[key].pairLabel}</button>
+            ))}
+          </div>
+          <strong>{formatPrice(quote ?? candles.at(-1)?.close)}</strong>
           <span className={change >= 0 ? 'market-up' : 'market-down'}>{change >= 0 ? '+' : ''}{change.toFixed(3)}%</span>
         </div>
         <div className="live"><i className={status} /> {feedLabel}{sourceTime ? ` · ${formatTime(sourceTime)}` : ''} · {sessionName}</div>
@@ -821,8 +1050,8 @@ export default function Home() {
 
           <div className="chart-panel">
             <div className="panel-label"><span>PRICE DELIVERY · {TIMEFRAMES[timeframe].label}</span><span>{historyLabel}</span></div>
-            <MarketChart candles={candles} analysis={analysis} strategy={timeframe === '5m' ? strategy : undefined} layers={layers} timeframe={timeframe} onSelect={(key) => { setSelectedConcept(key); setPanelTab('learn'); }} />
-            {!candles.length && <div className="chart-empty"><span>{status === 'offline' ? 'MARKET FEED UNAVAILABLE' : 'LOADING 48 HOURS OF OBSERVED XAU/USD DATA'}</span><small>No simulated candles will be shown.</small></div>}
+            <MarketChart candles={candles} analysis={analysis} strategy={timeframe === '5m' ? strategy : undefined} layers={layers} timeframe={timeframe} marketLabel={marketConfig.chartLabel} onSelect={(key) => { setSelectedConcept(key); setPanelTab('learn'); }} />
+            {!candles.length && <div className="chart-empty"><span>{status === 'offline' ? `${marketConfig.chartLabel} FEED UNAVAILABLE` : `LOADING OBSERVED ${marketConfig.chartLabel} DATA`}</span><small>No simulated candles will be shown.</small></div>}
           </div>
 
           <div className="lower-strip">
@@ -845,25 +1074,32 @@ export default function Home() {
             <span><small>REFERENCE</small><strong>{dxyContext ? dxyContext.latest.value.toFixed(2) : dxyStatus === 'offline' ? 'UNAVAILABLE' : 'LOADING'}</strong></span>
             <span><small>5-SESSION MOVE</small><strong className={dxyContext?.fiveSessionChange && dxyContext.fiveSessionChange < 0 ? 'market-down' : 'market-up'}>{dxyContext ? `${dxyContext.fiveSessionChange >= 0 ? '+' : ''}${dxyContext.fiveSessionChange.toFixed(2)}% · ${dxyContext.direction}` : '—'}</strong></span>
             <span><small>20-SESSION MOVE</small><strong>{dxyContext ? `${dxyContext.twentySessionChange >= 0 ? '+' : ''}${dxyContext.twentySessionChange.toFixed(2)}%` : '—'}</strong></span>
-            <span><small>WITH XAU 1H</small><strong>{dxyContext?.relationship ?? 'WAITING FOR DATA'}</strong></span>
+            <span><small>WITH {marketConfig.unit} 1H</small><strong>{dxyContext?.relationship ?? 'WAITING FOR DATA'}</strong></span>
             <span className="dxy-date">{dxyContext ? `FX-BASKET PROXY · ${dxyContext.latest.date}` : 'DAILY REFERENCE FEED'}</span>
           </button>
 
           <footer className="chart-note">
-            <span>DATA NOTE</span> Primary XAU/USD data comes from <a href="https://xaus.com/api/" target="_blank" rel="noreferrer">XAUS</a>. During a primary outage, spot automatically switches to <a href="https://gold-api.com/docs" target="_blank" rel="noreferrer">Gold API</a>; if no XAU history is available, the chart temporarily uses Kraken PAXG/USD candles as a clearly labeled emergency proxy. Primary retries back off from 5 to 15 to 30 minutes. The separate DXY daily reference comes from <a href="https://frankfurter.dev/" target="_blank" rel="noreferrer">Frankfurter</a>. All prices are indicative, not broker-executable quotes or trade instructions.
+            <span>DATA NOTE</span>
+            {marketId === 'xau' ? (
+              <> Primary XAU/USD data comes from <a href="https://xaus.com/api/" target="_blank" rel="noreferrer">XAUS</a>. During a primary outage, spot automatically switches to <a href="https://gold-api.com/docs" target="_blank" rel="noreferrer">Gold API</a>; if no XAU history is available, the chart temporarily uses Kraken PAXG/USD candles as a clearly labeled emergency proxy. Primary retries back off from 5 to 15 to 30 minutes.</>
+            ) : (
+              <> BTC/USD spot and 5-minute history come from the public <a href="https://docs.kraken.com/api-reference/market-data/get-ohlc-data" target="_blank" rel="noreferrer">Kraken market-data API</a>. Bitcoin history is direct BTC/USD data, not a proxy.</>
+            )}
+            {' '}The separate DXY daily reference comes from <a href="https://frankfurter.dev/" target="_blank" rel="noreferrer">Frankfurter</a>. All prices are indicative, not broker-executable quotes or trade instructions.
           </footer>
         </div>
 
         <aside className="intel-panel">
           <div className="panel-tabs" role="tablist" aria-label="Analysis panel">
             <button role="tab" aria-selected={panelTab === 'strategy'} className={panelTab === 'strategy' ? 'active' : ''} onClick={() => setPanelTab('strategy')}>STRATEGY</button>
+            <button role="tab" aria-selected={panelTab === 'bot'} className={panelTab === 'bot' ? 'active' : ''} onClick={() => setPanelTab('bot')}>DEMO BOT</button>
             <button role="tab" aria-selected={panelTab === 'live'} className={panelTab === 'live' ? 'active' : ''} onClick={() => setPanelTab('live')}>EVENTS</button>
             <button role="tab" aria-selected={panelTab === 'learn'} className={panelTab === 'learn' ? 'active' : ''} onClick={() => setPanelTab('learn')}>LEARN</button>
           </div>
 
           {panelTab === 'strategy' ? (
             <>
-              <div className="panel-heading"><span>PRICE ACTION MODEL · 1H → 5M</span><b className={isAPlus ? 'aplus' : strategy.status === 'INVALIDATED' ? 'invalid' : ''}>{isAPlus ? 'A+' : strategy.status === 'WAIT' ? 'NO TRADE' : strategy.status}</b></div>
+              <div className="panel-heading"><span>{marketConfig.unit} PRICE ACTION · 1H → 5M</span><b className={isAPlus ? 'aplus' : strategy.status === 'INVALIDATED' ? 'invalid' : ''}>{isAPlus ? 'A+' : strategy.status === 'WAIT' ? 'NO TRADE' : strategy.status}</b></div>
               {historySource === 'paxg-proxy' && (
                 <p className="proxy-warning"><b>EMERGENCY PROXY MODE</b> Structure is calculated from Kraken PAXG/USD candles. Treat every setup state as context until XAUS history returns.</p>
               )}
@@ -898,6 +1134,64 @@ export default function Home() {
                 <section><b>05 · Reset</b><p>If price violates the sweep extreme before confirmation, the sequence is invalid. Start again—never force the old idea.</p></section>
               </div>
               <p className="risk-note">Educational model only. Session timing improves context but does not create a trade. Backtest it before risking capital.</p>
+            </>
+          ) : panelTab === 'bot' ? (
+            <>
+              <div className="panel-heading"><span>{marketConfig.unit} DEMO EXECUTION</span><b className={demoAccount.enabled ? 'bot-armed' : ''}>{demoAccount.enabled ? 'ARMED' : 'OFF'}</b></div>
+              <div className="demo-lock"><b>SIMULATION ONLY · {marketConfig.chartLabel}</b><span>Separate virtual ledger · no broker connection · no real orders · no account credentials</span></div>
+
+              <div className="demo-metrics">
+                <span><small>BALANCE</small><strong>{formatMoney(demoAccount.balance)}</strong></span>
+                <span><small>EQUITY</small><strong>{formatMoney(demoEquity)}</strong></span>
+                <span><small>DAY P/L</small><strong className={demoAccount.dailyPnl >= 0 ? 'market-up' : 'market-down'}>{formatMoney(demoAccount.dailyPnl)}</strong></span>
+                <span><small>WIN RATE</small><strong>{demoAccount.trades.length ? `${demoWinRate.toFixed(0)}%` : '—'}</strong></span>
+              </div>
+
+              <div className="demo-controls">
+                <button className={demoAccount.enabled ? 'disarm' : 'arm'} onClick={toggleDemoBot}>{demoAccount.enabled ? 'DISARM DEMO BOT' : 'ARM DEMO BOT'}</button>
+                {demoAccount.position && <button className="close-demo" onClick={manuallyCloseDemoPosition}>CLOSE DEMO POSITION</button>}
+              </div>
+
+              <div className={`bot-gate ${demoGate.tone}`}>
+                <span>{demoGate.label}</span>
+                <p>{demoGate.detail}</p>
+                <small>LAST EVENT · {demoAccount.lastEvent}</small>
+              </div>
+
+              <div className="panel-heading"><span>OPEN DEMO POSITION</span><small>{demoAccount.position ? '1 / 1' : 'NONE'}</small></div>
+              {demoAccount.position ? (
+                <div className="demo-position">
+                  <div><span>{demoAccount.position.direction}</span><strong>{demoAccount.position.units.toFixed(marketId === 'btc' ? 6 : 3)} {marketConfig.unit} units</strong></div>
+                  <div className="position-levels">
+                    <span><small>ENTRY</small>{formatPrice(demoAccount.position.entry)}</span>
+                    <span><small>STOP</small>{formatPrice(demoAccount.position.stop)}</span>
+                    <span><small>5R TARGET</small>{formatPrice(demoAccount.position.target)}</span>
+                    <span><small>FLOATING</small><b className={demoFloatingPnl >= 0 ? 'market-up' : 'market-down'}>{formatMoney(demoFloatingPnl)}</b></span>
+                  </div>
+                </div>
+              ) : <p className="demo-empty">No simulated position is open.</p>}
+
+              <div className="panel-heading"><span>FIXED RISK GUARDRAILS</span><small>Cannot be changed</small></div>
+              <div className="demo-rules">
+                <span><small>RISK / TRADE</small><strong>{DEMO_BOT_RULES.riskPercent}%</strong></span>
+                <span><small>DAILY LOSS LOCK</small><strong>{DEMO_BOT_RULES.dailyLossPercent}%</strong></span>
+                <span><small>TRADES / DAY</small><strong>{demoAccount.tradesToday} / {DEMO_BOT_RULES.maxTradesPerDay}</strong></span>
+                <span><small>REWARD / RISK</small><strong>{DEMO_BOT_RULES.rewardRisk}R</strong></span>
+              </div>
+
+              <div className="panel-heading"><span>DEMO TRADE JOURNAL</span><small>{demoAccount.trades.length} closed</small></div>
+              <div className="demo-journal">
+                {[...demoAccount.trades].reverse().slice(0, 6).map((trade) => (
+                  <div key={`${trade.id}-${trade.closedAt}`}>
+                    <span><b>{trade.direction}</b><small>{formatTime(trade.closedAt)} · {trade.outcome}</small></span>
+                    <strong className={trade.pnl >= 0 ? 'market-up' : 'market-down'}>{formatMoney(trade.pnl)}<small>{trade.rMultiple.toFixed(2)}R</small></strong>
+                  </div>
+                ))}
+                {!demoAccount.trades.length && <p>No closed demo trades yet.</p>}
+              </div>
+
+              <button className="reset-demo" onClick={resetDemoAccount}>RESET $10,000 {marketConfig.unit} DEMO ACCOUNT</button>
+              <p className="risk-note">Each market has a separate device-local demo ledger. The simulator runs only while this page is open, never connects to MT5, and automatically reopens disarmed after a refresh.</p>
             </>
           ) : panelTab === 'live' ? (
             <>

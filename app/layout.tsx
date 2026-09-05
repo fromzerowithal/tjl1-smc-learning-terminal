@@ -21,7 +21,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   metadataBase: pagesMetadataBase,
   title: 'TJL1 · SMC Learning Terminal',
-  description: 'A live XAU/USD Smart Money Concepts learning and analysis terminal.',
+  description: 'A live XAU/USD and BTC/USD Smart Money Concepts learning, analysis, and demo-trading terminal.',
   openGraph: {
     title: 'TJL1 · SMC Learning Terminal',
     description: 'Read structure. Track liquidity. Learn the narrative.',
